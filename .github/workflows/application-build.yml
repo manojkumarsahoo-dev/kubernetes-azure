@@ -1,0 +1,122 @@
+name: CI/CD for app (Azure ACR)
+
+on:
+  workflow_dispatch:
+
+  # push:
+  #   branches:
+  #     - main
+
+env:
+  # Repository VARIABLE (Settings > Secrets and variables > Actions > Variables)
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  FRONTEND_SERVICES: "main appliances auto beauty books computers earphones electronics fashion food furniture googlegrocery googlemusic googlepay home mobiles sports toys two-wheelers"
+  BACKEND_SERVICE: "backend"
+
+permissions:
+  contents: write   # needed to commit updated image tags
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------
+      # Checkout
+      # -------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GIT_PAT }}
+          ref: main
+
+      # -------------------------
+      # Azure login (service principal secret)
+      # -------------------------
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          # Service-principal secret authentication; credentials are assembled
+          # from the existing GitHub repository secrets (no OIDC required).
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      # -------------------------
+      # ACR login
+      # -------------------------
+      - name: Login to Azure Container Registry
+        run: |
+          if [ -z "$ACR_NAME" ]; then
+            echo "Error: ACR_NAME variable is not set in Settings > Secrets and variables > Actions > Variables."
+            exit 1
+          fi
+          ACR_USERNAME=$(az acr credential show --name "$ACR_NAME" --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query 'passwords[0].value' -o tsv)
+          echo "$ACR_PASSWORD" | docker login "$ACR_NAME.azurecr.io" \
+            --username "$ACR_USERNAME" --password-stdin
+
+      # -------------------------
+      # Build & Push Images
+      # -------------------------
+      - name: Build and Push Docker Images
+        run: |
+          set -e
+          ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+          IMAGE_TAG="${GITHUB_SHA}"
+
+          # -------- Frontend --------
+          for service in $FRONTEND_SERVICES; do
+            FOLDER="frontend/$service"
+            REPO_NAME="shopping-site-$service"
+            IMAGE_URI="$ACR_LOGIN_SERVER/$REPO_NAME:$IMAGE_TAG"
+
+            if [ ! -f "$FOLDER/Dockerfile" ]; then
+              echo "No Dockerfile in $FOLDER, skipping..."
+              continue
+            fi
+
+            echo "Building $service -> $IMAGE_URI"
+            docker build -t "$IMAGE_URI" "$FOLDER"
+            docker push "$IMAGE_URI"
+
+            if [ -f "$FOLDER/deployment.yml" ]; then
+              sed -i "s|image:.*|image: $IMAGE_URI|g" "$FOLDER/deployment.yml"
+            else
+              echo "Warning: $FOLDER/deployment.yml not found, skipping image update."
+            fi
+          done
+
+          # -------- Backend --------
+          FOLDER="$BACKEND_SERVICE"
+          REPO_NAME="shopping-site-backend"
+          IMAGE_URI="$ACR_LOGIN_SERVER/$REPO_NAME:$IMAGE_TAG"
+
+          if [ -f "$FOLDER/Dockerfile" ]; then
+            echo "Building backend -> $IMAGE_URI"
+            docker build -t "$IMAGE_URI" "$FOLDER"
+            docker push "$IMAGE_URI"
+
+            if [ -f "$FOLDER/backend-deployment.yml" ]; then
+              sed -i "s|image:.*|image: $IMAGE_URI|g" "$FOLDER/backend-deployment.yml"
+            else
+              echo "Warning: $FOLDER/backend-deployment.yml not found, skipping image update."
+            fi
+          else
+            echo "No Dockerfile in $FOLDER, skipping backend..."
+          fi
+
+      # -------------------------
+      # Commit YAML changes (ArgoCD picks these up)
+      # -------------------------
+      - name: Commit updated YAML files
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+          git add "frontend/*/deployment.yml" "backend/backend-deployment.yml" 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No YAML image tag changes to commit."
+          else
+            git commit -m "Update image tags after build [skip ci]"
+            git push origin HEAD:main
+          fi

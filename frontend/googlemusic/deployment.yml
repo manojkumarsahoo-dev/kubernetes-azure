@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: googlemusic-deployment
+  labels:
+    app: googlemusic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: googlemusic
+  template:
+    metadata:
+      labels:
+        app: googlemusic
+    spec:
+      containers:
+      - name: googlemusic
+        image: veeraopsshop3rf6h.azurecr.io/shopping-site-googlemusic:23e4fed2d5f64a6a95bdef72385c0c437c613ab6
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: googlemusic-service
+  labels:
+    app: googlemusic
+spec:
+  type: ClusterIP
+  selector:
+    app: googlemusic
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80

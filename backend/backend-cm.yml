@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+data:
+  PORT: "5000"
+  FLASK_DEBUG: "false"
+
+  # Database (non-secret part). DB_HOST / DB_USER / DB_PASSWORD live in the
+  # "backend-secret" Secret (see scripts/create-backend-secret.sh).
+  DB_NAME: "cloud"
+  # Azure Database for MySQL Flexible Server requires TLS
+  DB_SSL: "true"
+
+  # Mail (non-secret part). MAIL_USERNAME / MAIL_PASSWORD live in "backend-secret".
+  MAIL_SERVER: "smtp.gmail.com"
+  MAIL_PORT: "587"
+  MAIL_USE_TLS: "true"
+  MAIL_USE_SSL: "false"

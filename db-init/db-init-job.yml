@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  namespace: microservices
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: mysql-client
+          image: mysql:8.4
+          command:
+            - sh
+            - -c
+            - mysql -h "$DB_HOST" -u "$DB_USER" --ssl-mode=REQUIRED < /sql/test.sql
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: DB_HOST
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: DB_USER
+            - name: MYSQL_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: DB_PASSWORD
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+      volumes:
+        - name: sql
+          configMap:
+            name: db-init-sql

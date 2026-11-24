@@ -1,0 +1,227 @@
+name: infra Terraform (AKS)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "~1.15.0"
+  TF_WORKING_DIR: AKS-Terraform
+
+  # Set these as GitHub Actions Variables if your sandbox uses different values.
+  # The resource group must already exist; this workflow never creates a resource group.
+  TFSTATE_LOCATION: ${{ vars.AZURE_LOCATION || 'westus2' }}
+  # Azure resource locations are independent of the existing resource group's metadata location.
+  TF_VAR_location: ${{ vars.AZURE_LOCATION || 'westus2' }}
+  TFSTATE_RG: ${{ vars.AZURE_RESOURCE_GROUP || '1-dcd63a99-playground-sandbox' }}
+  TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT || 'manojtfstate001' }}
+  TFSTATE_CONTAINER: tfstate
+  TFSTATE_KEY: veeraops-shop.tfstate
+
+  # Node VM size must be allowed by the sandbox policy (allowed-vm-scale-set-skus).
+  # Override with the Actions variable AKS_NODE_VM_SIZE if this size is rejected.
+  TF_VAR_node_vm_size: ${{ vars.AKS_NODE_VM_SIZE || 'Standard_D2s_v3' }}
+
+  TF_VAR_resource_group_name: ${{ vars.AZURE_RESOURCE_GROUP || '1-dcd63a99-playground-sandbox' }}
+
+  # Azure provider / backend authentication with a service principal secret
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  # The same administrator-provisioned service principal is used by AKS.
+  TF_VAR_aks_service_principal_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+  TF_VAR_aks_service_principal_client_secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+  # DB admin password, chosen by you and stored as a GitHub secret
+  TF_VAR_mysql_admin_password: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
+
+jobs:
+
+  # ============================================================
+  # TERRAFORM PLAN
+  # ============================================================
+  terraform-plan:
+    name: Terraform Validate & Plan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Check required secrets
+        run: |
+          test -n "$ARM_CLIENT_ID" || { echo "Missing AZURE_CLIENT_ID secret"; exit 1; }
+          test -n "$ARM_CLIENT_SECRET" || { echo "Missing AZURE_CLIENT_SECRET secret"; exit 1; }
+          test -n "$ARM_TENANT_ID" || { echo "Missing AZURE_TENANT_ID secret"; exit 1; }
+          test -n "$ARM_SUBSCRIPTION_ID" || { echo "Missing AZURE_SUBSCRIPTION_ID secret"; exit 1; }
+          test -n "$TF_VAR_aks_service_principal_client_id" || { echo "Missing AZURE_CLIENT_ID secret for AKS"; exit 1; }
+          test -n "$TF_VAR_aks_service_principal_client_secret" || { echo "Missing AZURE_CLIENT_SECRET secret for AKS"; exit 1; }
+          test -n "$TF_VAR_mysql_admin_password" || { echo "Missing MYSQL_ADMIN_PASSWORD secret"; exit 1; }
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          # Service-principal secret authentication; credentials are assembled
+          # from the existing GitHub repository secrets (no OIDC required).
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Verify Azure identity
+        run: az account show --query "{subscription:id, tenant:tenantId}" -o table
+
+      - name: Validate existing sandbox resource group
+        run: |
+          if ! az group show --name "$TFSTATE_RG" -o none; then
+            echo "Resource group '$TFSTATE_RG' does not exist or this identity cannot read it."
+            echo "Use the resource group supplied by your training sandbox in GitHub Actions Variables > AZURE_RESOURCE_GROUP."
+            exit 1
+          fi
+          RG_LOCATION=$(az group show --name "$TFSTATE_RG" --query location -o tsv)
+          echo "Using existing sandbox resource group '$TFSTATE_RG' (metadata location: $RG_LOCATION)."
+          echo "Existing resource-group metadata location is not validated here; the sandbox may provide a pre-created resource group in a region that is no longer allowed for new deployments."
+
+      - name: Create Terraform state storage if it does not exist
+        run: |
+          if az storage account show --name "$TFSTATE_STORAGE_ACCOUNT" --resource-group "$TFSTATE_RG" -o none 2>/dev/null; then
+            echo "Storage account already exists. Skipping creation."
+          else
+            # Validate the location only when creating a NEW state account.
+            # Existing sandbox storage accounts are reused regardless of their historical region.
+            case "$TFSTATE_LOCATION" in
+              canadaeast|centralus|eastus|eastus2|northcentralus|southcentralus|westcentralus|westus2|centralindia|southindia|westindia|japanwest|koreacentral|koreasouth|eastasia|germanynorth|germanywestcentral)
+                echo "Creating new Terraform state storage in sandbox-supported region: $TFSTATE_LOCATION"
+                ;;
+              *)
+                echo "Cannot create a new Terraform state storage account in '$TFSTATE_LOCATION'; choose a region allowed by the sandbox."
+                exit 1
+                ;;
+            esac
+            echo "Creating storage account in $TFSTATE_LOCATION..."
+            az storage account create \
+              --name "$TFSTATE_STORAGE_ACCOUNT" \
+              --resource-group "$TFSTATE_RG" \
+              --location "$TFSTATE_LOCATION" \
+              --sku Standard_LRS \
+              --min-tls-version TLS1_2 \
+              --allow-blob-public-access false \
+              -o none
+          fi
+
+          ACCOUNT_KEY=$(az storage account keys list \
+            --resource-group "$TFSTATE_RG" \
+            --account-name "$TFSTATE_STORAGE_ACCOUNT" \
+            --query "[0].value" -o tsv)
+
+          az storage container create \
+            --name "$TFSTATE_CONTAINER" \
+            --account-name "$TFSTATE_STORAGE_ACCOUNT" \
+            --account-key "$ACCOUNT_KEY" \
+            -o none
+          echo "Terraform state container is available."
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ACCOUNT_KEY=$(az storage account keys list \
+            --resource-group "$TFSTATE_RG" \
+            --account-name "$TFSTATE_STORAGE_ACCOUNT" \
+            --query "[0].value" -o tsv)
+
+          terraform init \
+            -backend-config="resource_group_name=$TFSTATE_RG" \
+            -backend-config="storage_account_name=$TFSTATE_STORAGE_ACCOUNT" \
+            -backend-config="container_name=$TFSTATE_CONTAINER" \
+            -backend-config="key=$TFSTATE_KEY" \
+            -backend-config="access_key=$ACCOUNT_KEY"
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      # Review this plan in the job log before approving the apply job.
+      # (No plan file is saved as an artifact: it would contain the DB password.)
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan
+
+  # ============================================================
+  # TERRAFORM APPLY (manual approval via the "production" environment)
+  # ============================================================
+  terraform-apply:
+    name: Terraform Apply
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          # Service-principal secret authentication; credentials are assembled
+          # from the existing GitHub repository secrets (no OIDC required).
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ACCOUNT_KEY=$(az storage account keys list \
+            --resource-group "$TFSTATE_RG" \
+            --account-name "$TFSTATE_STORAGE_ACCOUNT" \
+            --query "[0].value" -o tsv)
+
+          terraform init \
+            -backend-config="resource_group_name=$TFSTATE_RG" \
+            -backend-config="storage_account_name=$TFSTATE_STORAGE_ACCOUNT" \
+            -backend-config="container_name=$TFSTATE_CONTAINER" \
+            -backend-config="key=$TFSTATE_KEY" \
+            -backend-config="access_key=$ACCOUNT_KEY"
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve
+
+      - name: Terraform Outputs
+        id: tf-output
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform output
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+
+      # Use ACR admin credentials for image pulls in sandbox subscriptions where
+      # the GitHub identity cannot create AcrPull role assignments.
+      - name: Configure AKS access to ACR without Azure role assignments
+        run: |
+          set -euo pipefail
+          AKS_NAME=$(terraform -chdir="$TF_WORKING_DIR" output -raw aks_cluster_name)
+          ACR_NAME=$(terraform -chdir="$TF_WORKING_DIR" output -raw acr_name)
+          az aks get-credentials --resource-group "$TFSTATE_RG" --name "$AKS_NAME" --overwrite-existing
+          ACR_USERNAME=$(az acr credential show --name "$ACR_NAME" --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query 'passwords[0].value' -o tsv)
+          kubectl create namespace microservices --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret docker-registry acr-pull \
+            --docker-server="$ACR_NAME.azurecr.io" \
+            --docker-username="$ACR_USERNAME" \
+            --docker-password="$ACR_PASSWORD" \
+            --namespace=microservices \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default -n microservices \
+            --type=merge -p '{"imagePullSecrets":[{"name":"acr-pull"}]}'

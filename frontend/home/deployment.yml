@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: home-deployment
+  labels:
+    app: home
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: home
+  template:
+    metadata:
+      labels:
+        app: home
+    spec:
+      containers:
+      - name: home
+        image: veeraopsshop3rf6h.azurecr.io/shopping-site-home:23e4fed2d5f64a6a95bdef72385c0c437c613ab6
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: home-service
+  labels:
+    app: home
+spec:
+  type: ClusterIP
+  selector:
+    app: home
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
